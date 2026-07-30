@@ -1,6 +1,6 @@
 """
 DocuMind AI - Intelligent PDF Chat Assistant
-FastAPI backend that handles PDF upload/parsing, Claude API chat with
+FastAPI backend that handles PDF upload/parsing, OpenRouter API chat with
 streaming responses, chapter-wise summaries, and key-point extraction.
 """
 
@@ -17,27 +17,34 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 import pdfplumber
-import anthropic
+from openai import OpenAI
+from dotenv import load_dotenv
+
+load_dotenv()
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("documind")
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
-MODEL_NAME = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-5")
+OPENROUTER_API_KEY = os.getenv("ANTHROPIC_API_KEY") or os.getenv("OPENROUTER_API_KEY", "")
+MODEL_NAME = "openrouter/free"  # Change to "anthropic/claude-3.5-sonnet" if you have OpenRouter credits
 MAX_CONTEXT_CHARS = 180_000  # keep prompt within a safe token budget
 
-if not ANTHROPIC_API_KEY:
-    logger.warning("ANTHROPIC_API_KEY is not set. Set it as an environment variable.")
+if not OPENROUTER_API_KEY:
+    logger.warning("OPENROUTER_API_KEY / ANTHROPIC_API_KEY is not set. Set it in your .env file.")
 
-client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+client = OpenAI(
+    base_url="https://openrouter.ai/api/v1",
+    api_key=OPENROUTER_API_KEY,
+)
 
 app = FastAPI(title="DocuMind AI")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten this to your frontend domain in production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -45,8 +52,6 @@ app.add_middleware(
 
 # ---------------------------------------------------------------------------
 # In-memory document store
-# NOTE: For production, replace with Redis / DynamoDB / a database.
-# Data does not persist across container restarts or multiple instances.
 # ---------------------------------------------------------------------------
 DOCUMENTS: Dict[str, dict] = {}
 
@@ -154,24 +159,28 @@ async def chat(req: ChatRequest):
         f"DOCUMENT (filename: {doc['filename']}):\n{context}"
     )
 
-    messages = []
+    messages = [{"role": "system", "content": system_prompt}]
+    
     if req.history:
-        for turn in req.history[-10:]:  # keep last 10 turns for context
+        for turn in req.history[-10:]:
             role = turn.get("role")
             content = turn.get("content")
             if role in ("user", "assistant") and content:
                 messages.append({"role": role, "content": content})
+                
     messages.append({"role": "user", "content": req.question})
 
     def event_stream():
         try:
-            with client.messages.stream(
+            response = client.chat.completions.create(
                 model=MODEL_NAME,
                 max_tokens=1024,
-                system=system_prompt,
                 messages=messages,
-            ) as stream:
-                for text in stream.text_stream:
+                stream=True,
+            )
+            for chunk in response:
+                if chunk.choices and chunk.choices[0].delta.content:
+                    text = chunk.choices[0].delta.content
                     yield f"data: {json.dumps({'delta': text})}\n\n"
             yield f"data: {json.dumps({'done': True})}\n\n"
         except Exception as e:
@@ -194,12 +203,12 @@ async def summary(req: SummaryRequest):
     )
 
     try:
-        response = client.messages.create(
+        response = client.chat.completions.create(
             model=MODEL_NAME,
             max_tokens=1500,
             messages=[{"role": "user", "content": prompt}],
         )
-        text = "".join(block.text for block in response.content if block.type == "text")
+        text = response.choices[0].message.content
         return {"summary": text}
     except Exception as e:
         logger.exception("Summary generation failed")
@@ -219,12 +228,12 @@ async def keypoints(req: SummaryRequest):
     )
 
     try:
-        response = client.messages.create(
+        response = client.chat.completions.create(
             model=MODEL_NAME,
             max_tokens=800,
             messages=[{"role": "user", "content": prompt}],
         )
-        text = "".join(block.text for block in response.content if block.type == "text")
+        text = response.choices[0].message.content
         return {"key_points": text}
     except Exception as e:
         logger.exception("Key point extraction failed")
@@ -232,7 +241,7 @@ async def keypoints(req: SummaryRequest):
 
 
 # ---------------------------------------------------------------------------
-# Serve frontend static files (mounted last so /api routes take priority)
+# Serve frontend static files
 # ---------------------------------------------------------------------------
 FRONTEND_DIR = os.path.join(os.path.dirname(__file__), "..", "frontend")
 if os.path.isdir(FRONTEND_DIR):
